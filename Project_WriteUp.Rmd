@@ -1,0 +1,391 @@
+---
+title: "Porto Seguro's Safe Driver Prediction"
+author: "Manish Reddy Jannepally"
+date: "December 3, 2017"
+output: 
+  word_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,cache = TRUE,warning = FALSE,message = FALSE)
+```
+
+#INTRODUCTION TO PORTO SEGURO'S SAFE DRIVER PREDICTION
+
+##Problem Statement
+
+Porto Seguro's Insurance challenged Kagglers to build models that calculate the probability that a driver will file a claim in the next year. Hopefully, the models will help lower the cost for good drivers.
+
+##Explanation of Case Study
+
+Porto Seguro, one of Brazil's largest auto and homeowner insurance companies wants to avoid the inaccuracies in car insurance company's claim predictions which results in raise the cost of insurance for good drivers and reduce the price for bad ones.
+
+The challenge is to build a model that predicts the probability that a driver will initiate an auto insurance claim in the next year.
+
+##Data Description
+
+In the train and test data, features that belong to similar groupings are tagged as such in the feature names (e.g., ind, reg, car, calc). 
+
+In addition, feature names include the postfix bin to indicate binary features and cat to indicate categorical features. Features without these designations are either continuous or ordinal. 
+
+Values of -1 indicate that the feature was missing from the observation. The target columns signifies whether or not a claim was filed for that policy holder.
+
+##File Description
+
+- train.csv contains the training data, where each row corresponds to a policy holder, and the target columns signifies that a claim was filed.
+- test.csv contains the test data.
+- sample_submission.csv is submission file showing the correct format.
+
+#Loading Required Libraries
+
+The following libraries are used in this project...
+
+```{r libraries,echo=TRUE}
+library(dplyr) #data manipulation
+library(readr) #input/output
+library(tibble)#data wrangling
+library(data.table) #data manipulation
+library(forcats) #factor manipulation
+library(stringr) #string manipulation
+library(caret) #training and evaluation model
+library(randomForest) #Random Forest model
+library(MLmetrics) #Gini index
+library(ROSE) #over/under sampling
+```
+
+#PreProcessing the Data
+
+According to the data description given, values "-1" indicate the features are missing from the observation. So, while importing the data I have considered "-1","-1.0" as NAs.
+
+```{r loading the data}
+getwd()
+setwd("C:/Users/janne/Desktop/Edwisor/Project 2")
+rm(list = ls())
+TRAIN = fread("train.csv",na.strings = c("-1","-1.0"))
+TEST = fread("test.csv",na.strings = c("-1","-1.0"))
+dim(TRAIN);dim(TEST)
+```
+
+The TRAIN dataset contains **595212 Observations and 59 Variables** (including target variable). The TEST dataset contains **892816 Observations and 58 Variables** (excluding target variable). 
+
+Let's look at the structure and missing values of the datasets.
+
+```{r structure}
+str(TRAIN);str(TEST)
+sum(is.na(TRAIN));sum(is.na(TEST))
+```
+
+The structure of the datasets says the data types of the variables are either numerical or integer.As per the data description,features that belong to similar groupings are tagged as such in the feature names (e.g., ind, reg, car, calc) and also the binary and categorical variables are postfixed as _bin  and _cat respectively. Remaining features which are not tagged are either continuous or ordinal.
+
+So, we have to convert the data types according to the given data description. I have done this step by row binding TEST and TRAIN sets together as we can do the pre-processing to the whole data at once.
+
+```{r combined data}
+TEST$target = 0
+TEST$data = "test"
+TEST = TEST[, c(1, 60, 59, 2:58)]
+TRAIN$data = "train"
+TRAIN = TRAIN[, c(1, 60, 2:59)]
+combined_data = as.data.frame(rbind(TRAIN,TEST))
+rm(TRAIN,TEST)
+dim(combined_data)
+```
+
+I have added a 'target' column to the TEST set (to make TEST set have same number of variables) and a 'data' column to the TEST and TRAIN sets which can be used to identify the test and train observations. 
+
+The combined dataset has **1488028 Observations and 60 Variables**. I have formed a csv file
+named var_groups.csv with the names of variables as one column and another column with type of them according to the data description. We use this file to convert the data types of the variables as per the data discription.
+
+I have used the below code to convert the data types.
+
+```{r data types,echo=TRUE}
+var_groups = fread("var_groups.csv")
+names = intersect(colnames(combined_data), var_groups[["names"]])
+for(var_name in names){
+        
+        var_type = subset(var_groups, names %in% var_name, select=type)
+        if(var_type == "numeric")
+                combined_data[,var_name] = as.numeric(combined_data[,var_name])
+        else if(var_type == "binary" || var_type == "categorical")
+                combined_data[,var_name] <- as.factor(combined_data[,var_name])
+        else if(var_type == "ordinal")
+                combined_data[,var_name] <- as.ordered(combined_data[,var_name])
+}
+```
+
+Now, Let's see the structure of the data.
+
+```{r structure2}
+str(combined_data)
+```
+
+Let's explore the missing values of the data. We have already seen there are **846458** and **1270295** missing values in TRAIN and TEST data respectively. Below are the column wise missing values in combined data (both TEST and TRAIN)
+
+```{r missing values}
+missing_values = as.data.frame(colSums(is.na(combined_data)))
+missing_values
+miss_pct <- sapply(combined_data, function(x) { sum(is.na(x)) / length(x) })
+miss_pct <- miss_pct[miss_pct > 0]
+print(paste("Columns with missing values are:"))
+names(miss_pct)
+```
+
+There are a lot of concentration of mising values in few columns. Let's drop them with a threshold percentage. I am dropping variable with >=5% of missing values in them.
+
+```{r more or equal to 5 percent missing values}
+drop_var <- combined_data[, lapply( combined_data, function(m) sum(is.na(m)) / length(m) ) >= .05 ]
+print(paste("Columns with >=5% of missing values are:"))
+names(drop_var)
+combined_data = combined_data[,!(colnames(combined_data) %in% colnames(drop_var))]
+print(paste("Dimensions after droping the variables with >=5% of missing values:"))
+dim(combined_data)
+```
+
+There are missing values to be imputed in these remaining variables. I am imputing NAs with 'mode' in categorical/factor variable and with 'mean' in numerical variables. Let's see if any other missing values are there.
+
+```{r imputing values}
+mode <- function (x, na.rm) {
+  xtab <- table(x)
+  xmode <- names(which(xtab == max(xtab)))
+  if (length(xmode) > 1) xmode <- ">1 mode"
+  return(xmode)
+}
+df = combined_data #just making typing easy :P
+rm(combined_data)
+df$ps_ind_02_cat[is.na(df$ps_ind_02_cat)]<-mode(df$ps_ind_02_cat)
+df$ps_ind_04_cat[is.na(df$ps_ind_04_cat)]<-mode(df$ps_ind_04_cat)
+df$ps_ind_05_cat[is.na(df$ps_ind_05_cat)]<-mode(df$ps_ind_05_cat)
+df$ps_car_01_cat[is.na(df$ps_car_01_cat)]<-mode(df$ps_car_01_cat)
+df$ps_car_02_cat[is.na(df$ps_car_02_cat)]<-mode(df$ps_car_02_cat)
+df$ps_car_07_cat[is.na(df$ps_car_07_cat)]<-mode(df$ps_car_07_cat)
+df$ps_car_09_cat[is.na(df$ps_car_09_cat)]<-mode(df$ps_car_09_cat)
+df$ps_car_11[is.na(df$ps_car_11)]<-mode(df$ps_car_11)
+df$ps_car_12[is.na(df$ps_car_12)]<-mean(df$ps_car_12,na.rm=T)
+sum(is.na(df))
+```
+
+We have converted the data types as required and imputed the missing values. Now, split the combined data back to TRAIN and TEST sets.
+
+```{r train and tests}
+TRAIN<- df[1:595212,-2]
+print(paste("Dimensions of TRAIN:"))
+dim(TRAIN)
+TEST <- df[595213:1488028,-c(2,3)]
+print(paste("Dimensions of TEST"))
+dim(TEST);rm(df)
+```
+
+#Feature Engineering
+
+Let's analyze the target variable in TRAIN.
+
+```{r target}
+table(TRAIN$target)
+
+table(TRAIN$target)/nrow(TRAIN)
+```
+
+We can see that the target variable is imbalanced. Class 0 have 0.963% observations & 1 have 0.037% observations. Let's balance the data set using over/under sampling.
+
+```{r over/undersampling}
+balanced_train <- ovun.sample(target~.,data=TRAIN,method = "both",N =90000,p=.5,seed=1)$data
+print(paste("Dimensions of data after balancing the target variable"))
+dim(balanced_train)
+
+print(paste("No of missing values:"))
+sum(is.na(balanced_train)) #Missing values
+balanced_train <-as.data.frame(balanced_train)
+
+print(paste("Balance of the target variable:"))
+table(balanced_train$target)
+table(balanced_train$target)/nrow(balanced_train) # Now data is balanced
+rm(TRAIN)
+```
+
+Now the target variable is balanced in sampled out data frame with 90000 observations.
+
+We can take whole data set but it requires more computational power. And more over using over and under sampling technique, if we draw a large data set, the algorithm may drop contributing observations. We can use 'ROSE' function but it works only on factor and numerical data not on ordinal data.
+
+#Model Building
+
+I am buidling a Random Forest model to predict the target variable. To check the efficiency of the model, I am diving the TRAIN set to train and test sets with a ratio of 7:3(train:test).
+
+```{r sampling}
+s=sample(nrow(balanced_train),round(nrow(balanced_train)*0.7),replace=FALSE)
+train = balanced_train[s,]
+test = balanced_train[-s,]
+dim(train);dim(test)
+```
+ 
+The 'train' set's dimensions are 63000 X 55 and 'test' set's dimensions are 27000 X 55.
+
+#Random Forest
+
+Random forest can take only maximum 53 levels in a variable. "ps_car_11_cat" has 104 levels in total. So, it has to be removed to build a random forest model.
+
+```{r features for rf}
+train_rf = subset(train,select=-c(ps_car_11_cat))
+test_rf = subset(test,select=-c(ps_car_11_cat))
+dim(train_rf);dim(test_rf)
+```
+
+Let's build the model.
+
+```{r rf}
+library("randomForest")
+model_rf <- randomForest(as.factor(target) ~. , data = train_rf) # Fit Random forest
+#summary(model_rf)
+
+
+var.imp <- data.frame(importance(model_rf,type=2))
+var.imp$Variables <- row.names(var.imp)
+var.imp[order(var.imp$MeanDecreaseGini,decreasing = T),]
+
+# predict
+pred_rf <- predict(model_rf,test_rf)
+summary(pred_rf)
+library(caret)
+
+# score prediction using AUC
+confusionMatrix(pred_rf,test_rf$target)
+
+
+# The importance routine in r for random forest models gives us the mean decrease gini value. Higher the Mean Decrease Gini value, more important the variable.
+importance(model_rf)
+```
+
+```{r model1 plots,eval=FALSE}
+
+plot(model_rf, main = "Model") #Plot for number of trees and error
+
+varImpPlot(model_rf) #Plot for Important variable
+library(pROC)
+aucrf <- roc(as.numeric(test_rf$target), as.numeric(pred_rf),  ci=TRUE)
+plot(aucrf, ylim=c(0,1), print.thres=TRUE, main=paste('Random Forest AUC:',round(aucrf$auc[[1]],3)),col = 'blue')
+```
+
+We got an accuracy of 85% with the above model. Using the variable importance, I included only the important variable and build models. But the accuracy seems to be fluctuvating just 0.2 - 0.3%. Let's see the statistics model with important variables.
+
+```{r random forest 2,eval=TRUE}
+
+d<-importance(model_rf)
+
+##create dataset with only important variable
+train_imp<-subset(train_rf,select=c(1,(which(d>200))+1))
+test_imp<-subset(test_rf,select=c(1,(which(d>200))+1))
+
+model_rf_imp <- randomForest(as.factor(target) ~. , data = train_imp,keep.forest=TRUE)
+
+pred_rf_imp <- predict(model_rf_imp,test_imp)
+summary(pred_rf_imp)
+
+# score prediction using AUC
+confusionMatrix(pred_rf_imp,test_imp$target)
+
+```
+
+```{r model 2 plots,eval=FALSE}
+plot(model_rf_imp, main = "Model ")
+importance(model_rf_imp)
+varImpPlot(model_rf_imp)
+varImpPlot(model_rf_imp,sort = T,main="Variable Importance")
+library(pROC)
+# AUC value for Model is
+aucrf <- roc(as.numeric(test_imp$target), as.numeric(pred_rf_imp),  ci=TRUE)
+plot(aucrf, ylim=c(0,1), print.thres=TRUE, main=paste('Random Forest AUC:',round(aucrf$auc[[1]],3)),col = 'blue')
+```
+
+As experiments, I have build model with Naive Bayes, Gradient Boosting algorithms. Naive Bayes gave an accuracy of 58% where as the GBM gave 59% of accuracy. Random Forests gave us 85% percent of accuracy. So, Random Forest is our base model.
+
+```{r naivebayes,eval=FALSE}
+#taking out the target variable, just to avoid clumpsyness
+x_train = train
+x_test = test
+y_train = x_train$target
+y_test = x_test$target
+x_train$target = NULL
+x_test$target = NULL
+dim(x_train);dim(x_test)
+length(y_train);length(y_test)
+
+# To execute this model, make eval=TRUE
+#NAIVE BAYES
+library(e1071)
+library(caret)
+x_cat = cbind(x_train,y_train)
+fit = naiveBayes(y_train ~., data = x_cat)
+pred = predict(fit,x_test)
+summary(pred)
+confusionMatrix(pred,y_test)
+```
+
+```{r GBM,eval=FALSE}
+# To execute this model, make eval=TRUE
+#Gradient Boosting & Adaboosting
+fitControl = trainControl(method = "repeatedcv",number = 4,repeats = 4)
+fit_gbm = train(y_train ~., data = x_cat,method = "gbm",trControl = fitControl)
+pred_gbm = predict(fit_gbm,x_test)
+summary(pred_gbm)
+confusionMatrix(pred_gbm,y_test)
+```
+
+Now, I will find the normalized gini coefficient of the TEST data.
+
+The Gini Coefficient ranges from approximately 0 for random guessing, to approximately 0.5 for a perfect score. The theoretical maximum for the discrete calculation is (1 - frac_pos) / 2.
+
+```{r gini}
+library("MLmetrics")
+# NormalizedGini(y_pred, y_true)
+
+#Normalized Gini is 
+NormalizedGini(as.numeric(pred_rf_imp),as.numeric(test_imp$target))
+
+
+# Prediction for  Original Test data #
+#TEST_rf = TEST[,-c(ps_car_11_cat)]
+pred_rf_TEST <- predict(model_rf_imp,TEST,type="prob")
+
+#head(pred_rf_TEST)
+     
+#summary(pred_rf_TEST)
+
+final_data = data.frame(TEST$id ,pred_rf_TEST[,2]) # Prob of driver will claim insurance
+sum(is.na(final_data))
+colnames(final_data) <- c("id", "target") 
+rownames(final_data) = NULL
+head(final_data)
+# Submission file with id and target variable(probabilities).
+
+write.csv(final_data,file="Final_submission.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
